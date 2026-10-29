@@ -1,0 +1,13 @@
+[run]
+branch = True
+source = src
+omit =
+    src/thumbnail.py
+    src/server.py
+concurrency = thread
+
+[report]
+show_missing = True
+exclude_also =
+    class SubprocessRunner
+    def current_time

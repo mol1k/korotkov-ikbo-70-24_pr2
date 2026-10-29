@@ -124,20 +124,287 @@
 высота везде подобрана по пропорциям исходного видео.
 
 
-Сборка и запуск
----------------
+3. HTTP API (этап 2)
+--------------------
 
-Сборка не требуется. Установка инструментов проверки кода:
+Веб-приложение на FastAPI (src/app.py) управляет задачами генерации
+миниатюр. Схема данных:
+
+Client: id (int), time (int), platform (str) - клиент API.
+
+Prompt: id (int), time (int), argument (str), client (int), tags (str),
+stage (str) - задача на генерацию миниатюры. Поле argument - имя файла
+MP4 в папке видео, client ссылается на Client.id, stage - состояние
+задачи: queued, running, done или failed.
+
+Result: id (int), time (int), result (str), stage (str), error (str),
+prompt (int), cache_hit (int) - результат выполнения задачи. Поле
+result - путь к миниатюре, error - текст ошибки, prompt ссылается на
+Prompt.id, cache_hit равно 1, если миниатюра взята из кэша.
+
+Обязательные поля: id, Prompt.client и Result.prompt, остальные могут
+быть null.
+
+Обработчики (таблица 7 варианта):
+
+    1.1 PUT   /private/api/client-register/{id}   создать клиента
+        параметры строки запроса: time, platform
+    1.2 POST  /private/api/client-load            найти клиентов
+        параметры строки запроса (фильтры): platform, time
+    1.3 PATCH /private/api/client-alter/{id}      изменить клиента
+        тело в JSON: {"time": ..., "platform": ...}
+    2.1 PUT   /private/api/prompt-register/{id}   создать задачу
+        параметры строки запроса: client (обязательный), time,
+        argument, tags
+    2.2 POST  /private/api/prompt-load/{client}   найти задачи клиента
+        параметры строки запроса (фильтры): stage, tags, argument
+    2.3 PATCH /private/api/prompt-alter/{id}      изменить задачу
+        тело в JSON: {"time", "argument", "client", "tags", "stage"}
+    3.1 POST  /private/api/result-load/{prompt}   найти результаты задачи
+        параметры строки запроса (фильтры): stage, cache_hit
+    4.1 POST  /private/api/report-load            отчёт по формуле (7)
+
+Все обработчики возвращают JSON: запись, список записей или отчёт. В
+теле PATCH передаются только изменяемые поля; неизвестные поля и
+значения неверного типа отклоняются.
+
+Обязательные заголовки. Все обработчики используют методы POST, PUT
+или PATCH, поэтому проверяются оба заголовка, по порядку:
+
+    Content-Type: text/json      иначе 415 Unsupported Media Type
+    Accept-Language: ru-RU       иначе 406 Not Acceptable
+
+Проверка заголовков выполняется раньше всех остальных проверок.
+Допускаются параметры и списки значений, например
+"text/json; charset=utf-8" или "en-US, ru-RU;q=0.5".
+
+Коды ответов:
+
+    200 - успешно, тело в JSON
+    404 - нет записи с указанным id или нет клиента, на которого
+          ссылается задача
+    406, 415 - нет обязательного заголовка (см. выше)
+    409 - запись с таким id уже существует (повторный PUT)
+    422 - неверный тип параметра или некорректное тело JSON
+
+Асинхронное выполнение задач. Обработчик 2.1 сохраняет задачу со
+стадией queued и сразу возвращает ответ, а генерация миниатюры
+выполняется в фоне (BackgroundTasks FastAPI). Фоновая задача:
+
+1. переводит задачу в стадию running;
+2. ищет в кэше готовую миниатюру для того же argument - если она есть,
+   новый результат ссылается на неё и получает cache_hit = 1;
+3. иначе запускает утилиту этапа 1 через стандартный модуль subprocess:
+   видео из папки media подаётся на стандартный ввод, миниатюра
+   сохраняется в data/thumbnails/prompt-{id}.jpg;
+4. сохраняет Result и переводит задачу в стадию done или failed.
+
+Argument должен быть именем файла вида name.mp4 без пути: имена с
+папками (например, ../secret.mp4) отклоняются, чтобы нельзя было
+прочитать файл вне папки видео.
+
+Тестовый режим (ключ --test-mode): вместо запуска утилиты используется
+FakeRunner, который не обращается к ffmpeg и сразу возвращает имя
+миниатюры prompt-{id}.jpg. Остальная логика (кэш, стадии, ошибки) та
+же.
+
+Отчёт 4.1 строится по формуле варианта:
+
+    pi[C.platform, P.argument](
+        (sigma[C.time >= now - 7 min] C)
+        правое внешнее соединение [C.id = P.client]
+        P
+    )
+
+- sigma отбирает клиентов, активных за последние 7 минут;
+- правое внешнее соединение сохраняет все задачи; если клиент задачи
+  не прошёл отбор, platform равно null;
+- pi оставляет поля platform и argument и удаляет повторяющиеся строки.
+
+Модули:
+
+- src/app.py - маршруты FastAPI, проверка заголовков, разбор тела JSON,
+  create_app(service) создаёт приложение;
+- src/service.py - ThumbnailService: логика API, фоновая обработка
+  задач, кэш, отчёт;
+- src/storage.py - MemoryStorage: хранилище записей в памяти (get,
+  insert, update, search, next_id);
+- src/runner.py - SubprocessRunner (запуск утилиты через subprocess)
+  и FakeRunner (тестовый режим), проверка argument;
+- src/errors.py - NotFoundError, ConflictError;
+- src/server.py - запуск сервера uvicorn;
+- src/client.py - клиент API.
+
+Настройки сервера (python -m src.server):
+
+    --host       адрес, по умолчанию 127.0.0.1
+    --port       порт, по умолчанию 8000
+    --media      папка с видео, по умолчанию examples/media
+    --output     папка для миниатюр, по умолчанию data/thumbnails
+    --test-mode  тестовый режим без реальной генерации
+
+Клиент API (src/client.py) - класс ApiClient. Имена методов получены из
+маршрутов таблицы 7 заменой «/» и «-» на «_»:
+
+    private_api_client_register(uid, time=None, platform=None)
+    private_api_client_load(platform=None, time=None)
+    private_api_client_alter(uid, **changes)
+    private_api_prompt_register(uid, client, time=None, argument=None,
+                                tags=None)
+    private_api_prompt_load(client, stage=None, tags=None, argument=None)
+    private_api_prompt_alter(uid, **changes)
+    private_api_result_load(prompt, stage=None, cache_hit=None)
+    private_api_report_load()
+
+Клиент сам добавляет обязательные заголовки (атрибут headers). При
+коде ответа, отличном от 200, возбуждается ApiError с полями status и
+detail. Метод send(method, route, params, content) отправляет
+произвольный запрос.
+
+    from src.client import ApiClient
+
+    with ApiClient("http://127.0.0.1:8000") as api:
+        api.private_api_client_register(1, time=1794900000, platform="macos")
+        api.private_api_prompt_register(1, client=1, argument="testsrc.mp4")
+        print(api.private_api_result_load(1))
+        print(api.private_api_report_load())
+
+Тестирование на основе модели. Файл tests/test_api_state_machine.py,
+класс ApiStateMachine на основе RuleBasedStateMachine из hypothesis.
+
+- Сложная система - приложение FastAPI в тестовом режиме, с которым
+  тест работает только через ApiClient (транспорт - TestClient FastAPI).
+- Упрощённая модель - tests/reference_model.py: словари записей и
+  прямолинейная реализация кэша, стадий и отчёта.
+- hypothesis генерирует последовательности правил (100 сценариев до 30
+  шагов): регистрация, поиск и изменение клиентов и задач, загрузка
+  результатов, отчёт, ошибки 404/409/422 и запросы с неполными
+  заголовками (406/415). После каждого шага инвариант сравнивает список
+  клиентов сервера с моделью.
+- Шаг @initialize в начале каждого сценария создаёт клиента и две задачи
+  с одним видео, вторая из которых обязана попасть в кэш.
+- Время в тестах зафиксировано (now = 1760000000), чтобы отчёт был
+  детерминированным.
+
+Отчёт о покрытии кода тестами на основе ветвей (./run.sh test):
+
+    Name              Stmts   Miss Branch BrPart  Cover   Missing
+    -------------------------------------------------------------
+    src/__init__.py       0      0      0      0   100%
+    src/app.py           86      0      4      0   100%
+    src/client.py        53      0      2      0   100%
+    src/errors.py         6      0      0      0   100%
+    src/runner.py        31      0      4      0   100%
+    src/service.py       76      0     16      0   100%
+    src/storage.py       24      0      0      0   100%
+    -------------------------------------------------------------
+    TOTAL               276      0     26      0   100%
+
+Из замера исключены утилита этапа 1 (src/thumbnail.py), запуск сервера
+(src/server.py) и части, которые в тестовом режиме заменены
+детерминированными: SubprocessRunner и функция текущего времени
+current_time. Все 8 обработчиков HTTP API покрыты полностью.
+
+Пример работы API (./run.sh server, затем ./run.sh demo-api):
+
+    > регистрация клиента 1 (активен минуту назад)
+      {"id": 1, "time": 1794903361, "platform": "macos"}
+    > регистрация клиента 2 (активен час назад)
+      {"id": 2, "time": 1794899821, "platform": "windows"}
+    > повторная регистрация клиента 1
+      ошибка 409: Client: запись с id=1 уже существует
+    > поиск клиентов с platform=macos
+      [{"id": 1, "time": 1794903361, "platform": "macos"}]
+    > изменение клиента 2
+      {"id": 2, "time": 1794899821, "platform": "linux"}
+    > изменение клиента 2 с неверным типом поля
+      ошибка 422: [{'type': 'int_type', 'loc': ['time'], 'msg': 'Input should be a valid integer'}]
+    > задача 1: миниатюра для testsrc.mp4
+      {"id": 1, "time": null, "argument": "testsrc.mp4", "client": 1, "tags": "demo", "stage": "queued"}
+    > задача 2: миниатюра для mandelbrot.mp4
+      {"id": 2, "time": null, "argument": "mandelbrot.mp4", "client": 2, "tags": "demo", "stage": "queued"}
+    > задача 3: миниатюра для not_video.mp4
+      {"id": 3, "time": null, "argument": "not_video.mp4", "client": 1, "tags": "demo", "stage": "queued"}
+    > задача 4: миниатюра для ../secret.mp4
+      {"id": 4, "time": null, "argument": "../secret.mp4", "client": 2, "tags": "demo", "stage": "queued"}
+    > задача для несуществующего клиента 9
+      ошибка 404: Client: запись с id=9 не найдена
+    ... ждём 3 с, пока задачи выполнятся в фоне
+    > повтор задачи 1 (берётся из кэша)
+      {"id": 6, "time": null, "argument": "testsrc.mp4", "client": 2, "tags": null, "stage": "queued"}
+    > задачи клиента 1
+      [{"id": 1, "time": null, "argument": "testsrc.mp4", "client": 1, "tags": "demo", "stage": "done"}, {"id": 3, "time": null, "argument": "not_video.mp4", "client": 1, "tags": "demo", "stage": "failed"}]
+    > результат задачи 1
+      [{"id": 4, "time": 1794903421, "result": "data/thumbnails/prompt-1.jpg", "stage": "done", "error": null, "prompt": 1, "cache_hit": 0}]
+    > результат задачи 2
+      [{"id": 3, "time": 1794903421, "result": "data/thumbnails/prompt-2.jpg", "stage": "done", "error": null, "prompt": 2, "cache_hit": 0}]
+    > результат задачи 3
+      [{"id": 2, "time": 1794903421, "result": null, "stage": "failed", "error": "Ошибка: входные данные не являются файлом MP4", "prompt": 3, "cache_hit": 0}]
+    > результат задачи 4
+      [{"id": 1, "time": 1794903421, "result": null, "stage": "failed", "error": "аргумент должен быть именем файла .mp4 в папке видео", "prompt": 4, "cache_hit": 0}]
+    > результат задачи 5
+      ошибка 404: Prompt: запись с id=5 не найдена
+    > результат задачи 6
+      [{"id": 5, "time": 1794903424, "result": "data/thumbnails/prompt-1.jpg", "stage": "done", "error": null, "prompt": 6, "cache_hit": 1}]
+    > изменение задачи 4: перенос к клиенту 1
+      {"id": 4, "time": null, "argument": "../secret.mp4", "client": 1, "tags": "demo", "stage": "archived"}
+    > отчёт по формуле (7)
+      [{"platform": "macos", "argument": "testsrc.mp4"}, {"platform": null, "argument": "mandelbrot.mp4"}, {"platform": "macos", "argument": "not_video.mp4"}, {"platform": "macos", "argument": "../secret.mp4"}, {"platform": null, "argument": "testsrc.mp4"}]
+    > запрос без Content-Type
+      ошибка 415: требуется заголовок Content-Type: text/json
+    > запрос без Accept-Language
+      ошибка 406: требуется заголовок Accept-Language: ru-RU
+
+Тот же API через curl:
+
+    curl -X PUT "http://127.0.0.1:8000/private/api/client-register/1?platform=macos" \
+         -H "Content-Type: text/json" -H "Accept-Language: ru-RU"
+    {"id":1,"time":null,"platform":"macos"}
+
+    curl -X PATCH "http://127.0.0.1:8000/private/api/client-alter/1" \
+         -H "Content-Type: text/json" -H "Accept-Language: ru-RU" \
+         -d '{"platform": "linux"}'
+    {"id":1,"time":null,"platform":"linux"}
+
+    curl -i -X POST "http://127.0.0.1:8000/private/api/report-load" \
+         -H "Accept-Language: ru-RU"
+    HTTP/1.1 415 Unsupported Media Type
+
+Документация OpenAPI запущенного сервера: http://127.0.0.1:8000/docs
+(отправлять запросы оттуда нельзя без заголовков, используйте клиент
+или curl).
+
+
+Сборка, запуск и тесты
+----------------------
+
+Сборка не требуется. Установка зависимостей (FastAPI, uvicorn, httpx,
+hypothesis, coverage, flake8, pep8-naming):
 
     ./run.sh install
 
 Команды run.sh:
 
-    ./run.sh samples     создать примеры видео в examples/media
-    ./run.sh examples    запустить утилиту на 4 примерах и 2 ошибках
-    ./run.sh thumbnail   запустить утилиту, например:
-                         ./run.sh thumbnail out.jpg --width 200 < video.mp4
-    ./run.sh lint        проверка кода flake8
+    ./run.sh samples       создать примеры видео в examples/media
+    ./run.sh examples      утилита на 4 примерах и 2 ошибках
+    ./run.sh thumbnail     утилита, например:
+                           ./run.sh thumbnail out.jpg --width 200 < video.mp4
+    ./run.sh server        HTTP API с реальной генерацией миниатюр
+    ./run.sh server-test   HTTP API в тестовом режиме (без ffmpeg)
+    ./run.sh demo-api      демонстрация API через клиент
+                           (сервер должен быть запущен в другом окне)
+    ./run.sh test          тесты MBT и отчёт о покрытии
+    ./run.sh lint          проверка кода flake8
 
-Если python3 в системе не тот, в который установлены зависимости,
-укажите интерпретатор: export PYTHON=python.
+Порт сервера задаётся переменной PORT (по умолчанию 8000). Если
+python3 в системе не тот, в который установлены зависимости, укажите
+интерпретатор: export PYTHON=python.
+
+Без run.sh (например, в Windows) из корня репозитория:
+
+    python -m src.thumbnail out.jpg < video.mp4
+    python -m src.server --port 8000 [--test-mode]
+    python -m examples.api_demo http://127.0.0.1:8000
+    python -m coverage run -m unittest discover -s tests -t . -v
+    python -m coverage report
+    python -m flake8 src tests examples
