@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import tempfile
 
 from fastapi.testclient import TestClient
 from hypothesis import settings
@@ -10,7 +13,7 @@ from src.app import create_app
 from src.client import REQUIRED_HEADERS, ApiClient, ApiError, compact
 from src.runner import FakeRunner
 from src.service import ThumbnailService
-from src.storage import MemoryStorage
+from src.storage import TinyStorage
 from tests.reference_model import ReferenceModel
 
 NOW = 1_760_000_000
@@ -70,10 +73,6 @@ def fixed_now():
     return NOW
 
 
-def make_storage():
-    return MemoryStorage()
-
-
 def header_parts(headers, name):
     return [
         part.split(";")[0].strip()
@@ -110,7 +109,9 @@ class ApiStateMachine(RuleBasedStateMachine):
 
     def __init__(self):
         super().__init__()
-        service = ThumbnailService(make_storage(), FakeRunner(), fixed_now)
+        self.folder = tempfile.mkdtemp()
+        self.storage = TinyStorage(os.path.join(self.folder, "db.json"))
+        service = ThumbnailService(self.storage, FakeRunner(), fixed_now)
         self.api = ApiClient(http=TestClient(create_app(service)))
         self.model = ReferenceModel(NOW)
 
@@ -128,6 +129,8 @@ class ApiStateMachine(RuleBasedStateMachine):
     def teardown(self):
         with self.api:
             pass
+        self.storage.close()
+        shutil.rmtree(self.folder)
 
     @rule(target=clients, uid=ids, time=times, platform=platforms)
     def register_client(self, uid, time, platform):

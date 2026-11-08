@@ -227,8 +227,9 @@ FakeRunner, который не обращается к ffmpeg и сразу в�
   create_app(service) создаёт приложение;
 - src/service.py - ThumbnailService: логика API, фоновая обработка
   задач, кэш, отчёт;
-- src/storage.py - MemoryStorage: хранилище записей в памяти (get,
-  insert, update, search, next_id);
+- src/storage.py - хранилище записей (get, insert, update, search,
+  next_id): на этапе 2 - MemoryStorage в памяти, на этапе 3 -
+  TinyStorage на TinyDB (раздел 4);
 - src/runner.py - SubprocessRunner (запуск утилиты через subprocess)
   и FakeRunner (тестовый режим), проверка argument;
 - src/errors.py - NotFoundError, ConflictError;
@@ -241,6 +242,7 @@ FakeRunner, который не обращается к ffmpeg и сразу в�
     --port       порт, по умолчанию 8000
     --media      папка с видео, по умолчанию examples/media
     --output     папка для миниатюр, по умолчанию data/thumbnails
+    --db         файл базы TinyDB, по умолчанию data/db.json (этап 3)
     --test-mode  тестовый режим без реальной генерации
 
 Клиент API (src/client.py) - класс ApiClient. Имена методов получены из
@@ -286,7 +288,7 @@ detail. Метод send(method, route, params, content) отправляет
 - Время в тестах зафиксировано (now = 1760000000), чтобы отчёт был
   детерминированным.
 
-Отчёт о покрытии кода тестами на основе ветвей (./run.sh test):
+Отчёт о покрытии на этапе 2 (хранилище в памяти):
 
     Name              Stmts   Miss Branch BrPart  Cover   Missing
     -------------------------------------------------------------
@@ -296,9 +298,9 @@ detail. Метод send(method, route, params, content) отправляет
     src/errors.py         6      0      0      0   100%
     src/runner.py        31      0      4      0   100%
     src/service.py       76      0     16      0   100%
-    src/storage.py       24      0      0      0   100%
+    src/storage.py       37      0      0      0   100%
     -------------------------------------------------------------
-    TOTAL               276      0     26      0   100%
+    TOTAL               289      0     26      0   100%
 
 Из замера исключены утилита этапа 1 (src/thumbnail.py), запуск сервера
 (src/server.py) и части, которые в тестовом режиме заменены
@@ -375,10 +377,80 @@ current_time. Все 8 обработчиков HTTP API покрыты полн
 или curl).
 
 
+4. Хранение данных в TinyDB (этап 3)
+------------------------------------
+
+Хранилище в памяти MemoryStorage заменено на TinyStorage (src/storage.py)
+на основе документ-ориентированной СУБД TinyDB (библиотека tinydb).
+Данные сохраняются на диск в файл JSON (по умолчанию data/db.json) и
+не теряются при перезапуске сервера.
+
+Устройство:
+
+- каждой сущности соответствует своя таблица TinyDB: Client, Prompt,
+  Result;
+- запись хранится как документ, его doc_id совпадает с полем id, поэтому
+  поиск по id выполняется без перебора таблицы;
+- поиск с фильтрами выполняется запросом Query().fragment(filters):
+  документ подходит, если содержит все поля фильтра с теми же
+  значениями;
+- операции защищены блокировкой (threading.Lock): фоновые задачи
+  выполняются в других потоках, а TinyDB не потокобезопасна.
+
+Методы TinyStorage (тот же интерфейс, что был у MemoryStorage, поэтому
+ThumbnailService и обработчики API не изменились):
+
+    get(table, uid)               запись по id или None
+    insert(table, record)         добавить запись
+    update(table, uid, changes)   изменить поля записи
+    search(table, filters)        записи с совпадающими полями
+    next_id(table)                следующий свободный id
+    close()                       закрыть файл базы
+
+Настройка сервера: ключ --db задаёт файл базы данных:
+
+    python -m src.server --db data/db.json
+
+Чтобы начать с пустой базой, удалите папку data (или укажите другой
+файл в --db).
+
+Тесты MBT выполняются с TinyStorage: каждый сценарий hypothesis
+создаёт свой временный файл базы и удаляет его в конце. Отчёт о
+покрытии кода тестами на основе ветвей со слоем данных на TinyDB:
+
+    Name              Stmts   Miss Branch BrPart  Cover   Missing
+    -------------------------------------------------------------
+    src/__init__.py       0      0      0      0   100%
+    src/app.py           86      0      4      0   100%
+    src/client.py        53      0      2      0   100%
+    src/errors.py         6      0      0      0   100%
+    src/runner.py        31      0      4      0   100%
+    src/service.py       76      0     16      0   100%
+    src/storage.py       37      0      0      0   100%
+    -------------------------------------------------------------
+    TOTAL               289      0     26      0   100%
+
+Пример: данные сохраняются после перезапуска сервера. Сервер запущен,
+выполнен ./run.sh demo-api, сервер остановлен и запущен снова:
+
+    >>> после перезапуска сервера: client-load
+    {'id': 1, 'time': 1794903675, 'platform': 'macos'}
+    {'id': 2, 'time': 1794900135, 'platform': 'linux'}
+    >>> result-load/6
+    [{'id': 5, 'time': 1794903738, 'result': 'data/thumbnails/prompt-1.jpg', 'stage': 'done', 'error': None, 'prompt': 6, 'cache_hit': 1}]
+
+Начало файла data/db.json:
+
+    {"Client": {"1": {"id": 1, "time": 1794903675, "platform": "macos"},
+    "2": {"id": 2, "time": 1794900135, "platform": "linux"}}, "Prompt":
+    {"1": {"id": 1, "time": null, "argument": "testsrc.mp4", "client": 1,
+    "tags": "demo", "stage": "done"}, ...
+
+
 Сборка, запуск и тесты
 ----------------------
 
-Сборка не требуется. Установка зависимостей (FastAPI, uvicorn, httpx,
+Сборка не требуется. Установка зависимостей (FastAPI, uvicorn, httpx, tinydb,
 hypothesis, coverage, flake8, pep8-naming):
 
     ./run.sh install
