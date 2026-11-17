@@ -19,6 +19,7 @@ EXIT_OK = 0
 EXIT_INPUT_ERROR = 1
 EXIT_FFMPEG_ERROR = 2
 FFMPEG_ENV = "FFMPEG_PATH"
+SCALE_FILTER = "scale={}:-2"
 
 
 class ThumbnailError(Exception):
@@ -49,7 +50,7 @@ def build_command(ffmpeg, source, output, moment, width):
     return [
         ffmpeg, "-v", "error", "-y",
         "-ss", str(moment), "-i", source,
-        "-frames:v", "1", "-vf", f"scale={width}:-2",
+        "-frames:v", "1", "-vf", SCALE_FILTER.format(width),
         "-q:v", str(JPEG_QUALITY), "-f", "image2", output,
     ]
 
